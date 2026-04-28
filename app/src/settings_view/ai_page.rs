@@ -35,6 +35,7 @@ use crate::settings::{
     ShowConversationHistory, ShowHintText, ThinkingDisplayMode, VoiceInputEnabled,
     WarpDriveContextEnabled,
 };
+use crate::server::ids::ServerId;
 use crate::terminal::session_settings::{SessionSettings, SessionSettingsChangedEvent};
 use crate::terminal::CLIAgent;
 use crate::view_components::{
@@ -68,8 +69,8 @@ use warpui::{
         components::{Coords, UiComponent, UiComponentStyles},
         switch::{SwitchStateHandle, TooltipConfig},
     },
-    Action, AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext,
-    ViewHandle,
+    Action, AppContext, Element, Entity, ModelHandle, SingletonEntity, TypedActionView, View,
+    ViewContext, ViewHandle,
 };
 
 use super::execution_profile_view::{ExecutionProfileView, ExecutionProfileViewEvent};
@@ -5966,6 +5967,7 @@ impl SettingsWidget for CloudAgentComputerUseWidget {
 
 struct ApiKeysWidget {
     openai_api_key_editor: ViewHandle<EditorView>,
+    openai_base_url_editor: ViewHandle<EditorView>,
     anthropic_api_key_editor: ViewHandle<EditorView>,
     google_api_key_editor: ViewHandle<EditorView>,
 
@@ -5974,6 +5976,64 @@ struct ApiKeysWidget {
 }
 
 impl ApiKeysWidget {
+    fn openai_base_url_from_workspace(ctx: &AppContext) -> String {
+        let Some(team_uid) = UserWorkspaces::as_ref(ctx).current_team_uid() else {
+            return String::new();
+        };
+
+        AISettings::as_ref(ctx)
+            .openai_base_urls_by_workspace
+            .value()
+            .get(&team_uid.to_string())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn sync_openai_base_url_editor(editor: ViewHandle<EditorView>, ctx: &mut AppContext) {
+        let base_url = Self::openai_base_url_from_workspace(ctx);
+        editor.update(ctx, |editor, ctx| {
+            if editor.buffer_text(ctx) != base_url {
+                editor.set_buffer_text(&base_url, ctx);
+            }
+        });
+    }
+
+    fn save_openai_base_url_for_workspace(
+        team_uid: ServerId,
+        base_url: Option<String>,
+        ctx: &mut AppContext,
+    ) {
+        let mut urls_by_workspace = AISettings::as_ref(ctx)
+            .openai_base_urls_by_workspace
+            .value()
+            .clone();
+        if let Some(base_url) = base_url {
+            urls_by_workspace.insert(team_uid.to_string(), base_url);
+        } else {
+            urls_by_workspace.remove(&team_uid.to_string());
+        }
+        report_if_error!(AISettings::handle(ctx).update(ctx, |settings, ctx| {
+            settings
+                .openai_base_urls_by_workspace
+                .set_value(urls_by_workspace, ctx)
+        }));
+    }
+
+    fn update_openai_base_url_editor_interaction_state(
+        editor: ViewHandle<EditorView>,
+        workspace_handle: &ModelHandle<UserWorkspaces>,
+        ctx: &mut ViewContext<AISettingsPageView>,
+    ) {
+        let is_any_ai_enabled = AISettings::handle(ctx).as_ref(ctx).is_any_ai_enabled(ctx);
+        let workspaces = workspace_handle.as_ref(ctx);
+        let is_byo_enabled = workspaces.is_byo_api_key_enabled();
+        AISettingsPageView::update_editor_interaction_state(
+            editor,
+            is_any_ai_enabled && is_byo_enabled && workspaces.current_team_uid().is_some(),
+            ctx,
+        );
+    }
+
     fn new(ctx: &mut ViewContext<<Self as SettingsWidget>::View>) -> Self {
         let ai_settings = AISettings::as_ref(ctx);
         let workspace_handle = UserWorkspaces::handle(ctx);
@@ -6059,6 +6119,111 @@ impl ApiKeysWidget {
         }
 
         create_api_key_editor!(openai_api_key_editor, openai_key, set_openai_key, "sk-...");
+        let openai_base_url_editor = ctx.add_typed_action_view(move |ctx| {
+            let appearance = Appearance::handle(ctx).as_ref(ctx);
+            let options = SingleLineEditorOptions {
+                text: TextOptions {
+                    font_size_override: Some(appearance.ui_font_size()),
+                    font_family_override: Some(appearance.monospace_font_family()),
+                    text_colors_override: Some(TextColors {
+                        default_color: appearance.theme().active_ui_text_color(),
+                        disabled_color: appearance.theme().disabled_ui_text_color(),
+                        hint_color: appearance.theme().disabled_ui_text_color(),
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut editor = EditorView::single_line(options, ctx);
+            editor.set_placeholder_text("https://api.openai.com/v1", ctx);
+            editor.set_buffer_text(&Self::openai_base_url_from_workspace(ctx), ctx);
+            editor
+        });
+        AISettingsPageView::update_editor_interaction_state(
+            openai_base_url_editor.clone(),
+            is_any_ai_enabled
+                && is_byo_enabled
+                && workspace_handle.as_ref(ctx).current_team_uid().is_some(),
+            ctx,
+        );
+        ctx.subscribe_to_view(
+            &openai_base_url_editor,
+            |_, openai_base_url_editor, event, ctx| {
+                if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
+                    let base_url = openai_base_url_editor
+                        .as_ref(ctx)
+                        .buffer_text(ctx)
+                        .trim()
+                        .trim_end_matches('/')
+                        .to_string();
+                    let base_url = (!base_url.is_empty()).then_some(base_url);
+
+                    let Some(team_uid) = UserWorkspaces::as_ref(ctx).current_team_uid() else {
+                        report_error!(anyhow::anyhow!(
+                            "Cannot update OpenAI base URL without a current team workspace"
+                        ));
+                        return;
+                    };
+
+                    UserWorkspaces::handle(ctx).update(ctx, |workspaces, ctx| {
+                        workspaces.update_openai_base_url(team_uid, base_url, ctx);
+                    });
+                }
+            },
+        );
+        let openai_base_url_editor_clone = openai_base_url_editor.clone();
+        ctx.subscribe_to_model(&workspace_handle, move |_, workspace, event, ctx| {
+            match event {
+                UserWorkspacesEvent::TeamsChanged => {
+                    ApiKeysWidget::sync_openai_base_url_editor(
+                        openai_base_url_editor_clone.clone(),
+                        ctx,
+                    );
+                    ApiKeysWidget::update_openai_base_url_editor_interaction_state(
+                        openai_base_url_editor_clone.clone(),
+                        &workspace,
+                        ctx,
+                    );
+                    ctx.notify();
+                }
+                UserWorkspacesEvent::UpdateOpenAIBaseUrlSuccess { team_uid, base_url } => {
+                    ApiKeysWidget::save_openai_base_url_for_workspace(
+                        *team_uid,
+                        base_url.clone(),
+                        ctx,
+                    );
+                    ApiKeysWidget::sync_openai_base_url_editor(
+                        openai_base_url_editor_clone.clone(),
+                        ctx,
+                    );
+                    ctx.notify();
+                }
+                UserWorkspacesEvent::UpdateOpenAIBaseUrlRejected(_) => {
+                    ApiKeysWidget::sync_openai_base_url_editor(
+                        openai_base_url_editor_clone.clone(),
+                        ctx,
+                    );
+                    ctx.notify();
+                }
+                _ => {}
+            }
+        });
+        let openai_base_url_editor_clone = openai_base_url_editor.clone();
+        let workspace_handle_clone = workspace_handle.clone();
+        ctx.subscribe_to_model(&AISettings::handle(ctx), move |_, _, event, ctx| {
+            if let AISettingsChangedEvent::IsAnyAIEnabled { .. } = event {
+                ApiKeysWidget::sync_openai_base_url_editor(
+                    openai_base_url_editor_clone.clone(),
+                    ctx,
+                );
+                ApiKeysWidget::update_openai_base_url_editor_interaction_state(
+                    openai_base_url_editor_clone.clone(),
+                    &workspace_handle_clone,
+                    ctx,
+                );
+                ctx.notify();
+            }
+        });
         create_api_key_editor!(
             anthropic_api_key_editor,
             anthropic_key,
@@ -6074,6 +6239,7 @@ impl ApiKeysWidget {
 
         Self {
             openai_api_key_editor,
+            openai_base_url_editor,
             anthropic_api_key_editor,
             google_api_key_editor,
 
@@ -6149,6 +6315,13 @@ impl ApiKeysWidget {
             "OpenAI API Key",
             self.openai_api_key_editor.clone(),
             is_enabled,
+            app,
+        ));
+        column.add_child(render_api_key_input(
+            appearance,
+            "OpenAI-compatible Base URL",
+            self.openai_base_url_editor.clone(),
+            is_enabled && UserWorkspaces::as_ref(app).current_team_uid().is_some(),
             app,
         ));
         column.add_child(render_api_key_input(

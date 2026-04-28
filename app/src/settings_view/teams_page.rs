@@ -999,6 +999,10 @@ impl TeamsPageView {
             UserWorkspacesEvent::UpdateWorkspaceSettingsRejected(_) => {
                 // as of right now, this is only emitted on the billing & usage page
             }
+            UserWorkspacesEvent::UpdateOpenAIBaseUrlSuccess { .. }
+            | UserWorkspacesEvent::UpdateOpenAIBaseUrlRejected(_) => {
+                // OpenAI-compatible base URL updates are handled in the AI settings page
+            }
             UserWorkspacesEvent::AiOveragesUpdated => {
                 // AI overages update doesn't affect teams page display
             }

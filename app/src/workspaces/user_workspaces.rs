@@ -79,6 +79,11 @@ pub enum UserWorkspacesEvent {
     SetTeamMemberRoleRejected(anyhow::Error),
     UpdateWorkspaceSettingsSuccess,
     UpdateWorkspaceSettingsRejected(anyhow::Error),
+    UpdateOpenAIBaseUrlSuccess {
+        team_uid: ServerId,
+        base_url: Option<String>,
+    },
+    UpdateOpenAIBaseUrlRejected(anyhow::Error),
     AiOveragesUpdated,
     PurchaseAddonCreditsSuccess,
     PurchaseAddonCreditsRejected(anyhow::Error),
@@ -1225,6 +1230,66 @@ impl UserWorkspaces {
             },
             Self::on_update_workspace_metadata,
         );
+    }
+
+    pub fn update_openai_base_url(
+        &mut self,
+        team_uid: ServerId,
+        base_url: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let workspace_client = self.workspace_client.clone();
+        let base_url_for_event = base_url.clone();
+        let _ = ctx.spawn(
+            async move {
+                workspace_client
+                    .update_openai_base_url(team_uid, base_url)
+                    .await
+            },
+            move |workspaces, result, ctx| {
+                workspaces.on_update_openai_base_url_metadata(
+                    result,
+                    team_uid,
+                    base_url_for_event,
+                    ctx,
+                );
+            },
+        );
+    }
+
+    fn on_update_openai_base_url_metadata(
+        &mut self,
+        result: Result<WorkspacesMetadataResponse>,
+        team_uid: ServerId,
+        base_url: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        match result {
+            Ok(result) => {
+                let wrapped = WorkspacesMetadataWithPricing {
+                    metadata: result,
+                    pricing_info: None,
+                };
+                self.on_workspaces_updated(Ok(wrapped), ctx);
+                ctx.emit(UserWorkspacesEvent::UpdateOpenAIBaseUrlSuccess {
+                    team_uid,
+                    base_url,
+                });
+                ctx.emit(UserWorkspacesEvent::UpdateWorkspaceSettingsSuccess);
+            }
+            Err(err) => {
+                let err_for_openai_event = anyhow::anyhow!("{}", err);
+                let err_for_settings_event = anyhow::anyhow!("{}", err);
+                self.on_workspaces_updated(Err(err), ctx);
+                ctx.emit(UserWorkspacesEvent::UpdateOpenAIBaseUrlRejected(
+                    err_for_openai_event,
+                ));
+                ctx.emit(UserWorkspacesEvent::UpdateWorkspaceSettingsRejected(
+                    err_for_settings_event,
+                ));
+            }
+        };
+        ctx.notify();
     }
 
     fn on_update_workspace_metadata(
