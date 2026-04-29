@@ -1144,6 +1144,14 @@ define_settings_group!(AISettings, settings: [
         private: true,
     },
 
+    openai_base_urls_by_workspace: OpenAIBaseUrlsByWorkspace {
+        type: HashMap<String, String>,
+        default: HashMap::new(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        private: true,
+    },
+
     // This is not a user-visible setting - its merely a one-time flag to track if the agents 3 launch modal
     // has been shown to the user.
     //

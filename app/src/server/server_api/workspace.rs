@@ -14,8 +14,8 @@ use warp_graphql::mutations::stripe_billing_portal::{
     StripeBillingPortalVariables,
 };
 use warp_graphql::mutations::update_workspace_settings::{
-    AddonCreditsSettingsInput, UpdateWorkspaceSettings, UpdateWorkspaceSettingsInput,
-    UpdateWorkspaceSettingsResult, UpdateWorkspaceSettingsVariables,
+    AddonCreditsSettingsInput, LlmSettingsInput, UpdateWorkspaceSettings,
+    UpdateWorkspaceSettingsInput, UpdateWorkspaceSettingsResult, UpdateWorkspaceSettingsVariables,
     UsageBasedPricingSettingsInput,
 };
 use warp_graphql::queries::get_ai_overages_for_workspace::{
@@ -55,6 +55,12 @@ pub trait WorkspaceClient: 'static + Send + Sync {
         auto_reload_enabled: Option<bool>,
         max_monthly_spend_cents: Option<i32>,
         selected_auto_reload_credit_denomination: Option<i32>,
+    ) -> Result<WorkspacesMetadataResponse>;
+
+    async fn update_openai_base_url(
+        &self,
+        team_uid: ServerId,
+        base_url: Option<String>,
     ) -> Result<WorkspacesMetadataResponse>;
 }
 
@@ -98,6 +104,7 @@ impl WorkspaceClient for ServerApi {
         let variables = UpdateWorkspaceSettingsVariables {
             input: UpdateWorkspaceSettingsInput {
                 workspace_uid: team_uid.to_string(),
+                set_llm_settings: None,
                 set_usage_based_pricing_settings: Some(UsageBasedPricingSettingsInput {
                     enabled: Some(usage_based_pricing_enabled),
                     max_monthly_spend_cents: max_monthly_spend_cents.map(|cents| cents as i32),
@@ -149,6 +156,40 @@ impl WorkspaceClient for ServerApi {
         }
     }
 
+    async fn update_openai_base_url(
+        &self,
+        team_uid: ServerId,
+        base_url: Option<String>,
+    ) -> Result<WorkspacesMetadataResponse> {
+        let base_url = base_url.and_then(|url| {
+            let url = url.trim().trim_end_matches('/').to_string();
+            (!url.is_empty()).then_some(url)
+        });
+        let variables = UpdateWorkspaceSettingsVariables {
+            input: UpdateWorkspaceSettingsInput {
+                workspace_uid: team_uid.to_string(),
+                set_llm_settings: Some(LlmSettingsInput { base_url }),
+                set_usage_based_pricing_settings: None,
+                set_addon_credits_settings: None,
+            },
+            request_context: get_request_context(),
+        };
+        let operation = UpdateWorkspaceSettings::build(variables);
+        let response = self.send_graphql_request(operation, None).await?;
+
+        match response.update_workspace_settings {
+            UpdateWorkspaceSettingsResult::UpdateWorkspaceSettingsOutput(_) => {
+                TeamClient::workspaces_metadata(self)
+                    .await
+                    .map(|w| w.metadata)
+            }
+            UpdateWorkspaceSettingsResult::UserFacingError(error) => {
+                Err(anyhow!(get_user_facing_error_message(error)))
+            }
+            UpdateWorkspaceSettingsResult::Unknown => Err(anyhow!("Unknown error")),
+        }
+    }
+
     async fn purchase_addon_credits(
         &self,
         team_uid: ServerId,
@@ -196,6 +237,7 @@ impl WorkspaceClient for ServerApi {
         let variables = UpdateWorkspaceSettingsVariables {
             input: UpdateWorkspaceSettingsInput {
                 workspace_uid: team_uid.to_string(),
+                set_llm_settings: None,
                 set_usage_based_pricing_settings: None,
                 set_addon_credits_settings: Some(AddonCreditsSettingsInput {
                     auto_reload_enabled,
